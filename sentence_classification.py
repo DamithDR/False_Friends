@@ -41,11 +41,11 @@ from sklearn.metrics import (
 # SEED         = 42
 # OUTPUT_DIR   = "outputs/sentence_classification"
 
-DEFAULT_MODEL = "microsoft/mdeberta-v3-base"
+DEFAULT_MODEL = "xlm-roberta-base"
 MAX_LENGTH    = 512          # sentence pairs can be long; 256 covers >95 % of data
 BATCH_SIZE    = 2
 EPOCHS        = 5
-LR            = 2e-5
+LR            = 2e-3
 WARMUP_RATIO = 0.1
 WEIGHT_DECAY = 0.01
 SEED         = 42
