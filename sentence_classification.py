@@ -41,11 +41,11 @@ from sklearn.metrics import (
 # SEED         = 42
 # OUTPUT_DIR   = "outputs/sentence_classification"
 
-MODEL_NAME   = "xlm-roberta-base"
-MAX_LENGTH   = 512          # sentence pairs can be long; 256 covers >95 % of data
-BATCH_SIZE   = 2
-EPOCHS       = 5
-LR           = 1e-6
+DEFAULT_MODEL = "microsoft/mdeberta-v3-base"
+MAX_LENGTH    = 512          # sentence pairs can be long; 256 covers >95 % of data
+BATCH_SIZE    = 2
+EPOCHS        = 5
+LR            = 2e-5
 WARMUP_RATIO = 0.1
 WEIGHT_DECAY = 0.01
 SEED         = 42
@@ -167,12 +167,17 @@ def evaluate(model, loader, device) -> Dict:
 
 # ── Main training loop ────────────────────────────────────────────────────────
 
-def run(lang: str):
+def _slugify_model(model_name: str) -> str:
+    """Make a filesystem-safe folder name from a HF model id."""
+    return model_name.replace("/", "__").replace(" ", "_")
+
+
+def run(lang: str, model_name: str):
     cfg = DATA[lang]
     print(f"\n{'='*65}")
     print(f"  Task : Sentence-level False Friend Classification")
     print(f"  Pair : {cfg['lang_name']}")
-    print(f"  Model: {MODEL_NAME}")
+    print(f"  Model: {model_name}")
     print(f"{'='*65}\n")
 
     set_seed(SEED)
@@ -192,7 +197,7 @@ def run(lang: str):
           f"neg={sum(1-e.label for e in test_examples)})")
 
     # ── Tokenizer & datasets ─────────────────────────────────────────────────
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     train_ds  = FalseFriendDataset(train_examples, tokenizer, MAX_LENGTH)
     test_ds   = FalseFriendDataset(test_examples,  tokenizer, MAX_LENGTH)
 
@@ -201,7 +206,7 @@ def run(lang: str):
 
     # ── Model ────────────────────────────────────────────────────────────────
     model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME, num_labels=2
+        model_name, num_labels=2
     ).to(device)
 
     # ── Optimiser & scheduler ────────────────────────────────────────────────
@@ -224,8 +229,9 @@ def run(lang: str):
 
     # ── Training loop ────────────────────────────────────────────────────────
     best_f1, best_epoch = 0.0, 0
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    model_save_path = os.path.join(OUTPUT_DIR, f"best_model_{lang}")
+    run_dir = os.path.join(OUTPUT_DIR, _slugify_model(model_name))
+    os.makedirs(run_dir, exist_ok=True)
+    model_save_path = os.path.join(run_dir, f"best_model_{lang}")
 
     print(f"\n{'Epoch':<8}{'Train Loss':<14}{'Val Loss':<12}"
           f"{'Accuracy':<12}{'F1 (macro)':<14}{'Precision':<12}{'Recall'}")
@@ -272,10 +278,10 @@ def run(lang: str):
     print(f"  {cm}")
 
     # ── Save results ─────────────────────────────────────────────────────────
-    results_path = os.path.join(OUTPUT_DIR, f"results_{lang}.txt")
+    results_path = os.path.join(run_dir, f"results_{lang}.txt")
     with open(results_path, "w", encoding="utf-8") as f:
         f.write(f"Language pair : {cfg['lang_name']}\n")
-        f.write(f"Model         : {MODEL_NAME}\n")
+        f.write(f"Model         : {model_name}\n")
         f.write(f"Best epoch    : {best_epoch} / {EPOCHS}\n")
         f.write(f"Best macro-F1 : {best_f1:.4f}\n\n")
         f.write(f"Accuracy  : {final['accuracy']:.4f}\n")
@@ -296,15 +302,19 @@ def run(lang: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Sentence-level false friend classification with XLM-RoBERTa"
+        description="Sentence-level false friend classification"
     )
     parser.add_argument(
         "--lang", choices=["es", "fr"], default=None,
         help="Language pair to train: 'es' (EN-ES) or 'fr' (EN-FR). "
              "Omit to run both sequentially."
     )
+    parser.add_argument(
+        "--model", default=DEFAULT_MODEL,
+        help=f"HuggingFace model id or local path. Default: {DEFAULT_MODEL}"
+    )
     args = parser.parse_args()
 
     langs = [args.lang] if args.lang else ["es", "fr"]
     for lang in langs:
-        run(lang)
+        run(lang, args.model)
