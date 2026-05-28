@@ -32,10 +32,10 @@ from sklearn.metrics import (
 # ── Config ────────────────────────────────────────────────────────────────────
 
 MODEL_NAME   = "xlm-roberta-base"
-MAX_LENGTH   = 256          # sentence pairs can be long; 256 covers >95 % of data
-BATCH_SIZE   = 4
+MAX_LENGTH   = 512          # sentence pairs can be long; 256 covers >95 % of data
+BATCH_SIZE   = 2
 EPOCHS       = 5
-LR           = 2e-4
+LR           = 1e-6
 WARMUP_RATIO = 0.1
 WEIGHT_DECAY = 0.01
 SEED         = 42
