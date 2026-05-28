@@ -10,6 +10,8 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=d.dolamullage@lancaster.ac.uk
 
+source venv/bin/activate
+
 mkdir -p logs
 
 # Pass --lang es / --lang fr via sbatch, or leave empty to run both sequentially:
