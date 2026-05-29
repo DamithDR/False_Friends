@@ -14,10 +14,10 @@ source venv/bin/activate
 
 mkdir -p logs outputs/token_classification
 
-# Defaults — override on the command line, e.g.:
-#   sbatch run_token_classification.sh --lang es --model_name microsoft/mdeberta-v3-base
-#   sbatch run_token_classification.sh --lang fr --epochs 15
-LANG_ARG="${LANG_ARG:-es}"
+# Defaults to FR. Override with the LANG_ARG env var, e.g.:
+#   LANG_ARG=es sbatch run_token_classification.sh
+#   sbatch run_token_classification.sh --epochs 15 --model_name microsoft/mdeberta-v3-base
+LANG_ARG="${LANG_ARG:-fr}"
 
 python token_classification.py train \
     --model_name xlm-roberta-base \

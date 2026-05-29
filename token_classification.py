@@ -516,32 +516,42 @@ def train_model(
 # ──────────────────────────────────────────────────────────────────────────────
 # Predict
 # ──────────────────────────────────────────────────────────────────────────────
-def predict(model_path, source, target):
-    """
-    Predict false friends in a source-target sentence pair.
+def load_model(model_path, device=None):
+    """Load a trained token-classification model + tokenizer once.
 
-    Args:
-        model_path: Path to trained model directory
-        source:     Source (English) sentence string
-        target:     Target (Spanish) sentence string
-
-    Returns:
-        dict with keys: source_tokens, target_tokens, source_ff, target_ff
+    Returns (model, tokenizer, max_length). Intended to be cached by callers
+    (e.g. the Streamlit app wraps this in @st.cache_resource) so the weights
+    are not reloaded on every prediction.
     """
     tokenizer = AutoTokenizer.from_pretrained(model_path, add_prefix_space=True)
     model = AutoModelForTokenClassification.from_pretrained(model_path)
     model.eval()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    config_path = os.path.join(model_path, "ff_config.json")
     max_length = 512
+    config_path = os.path.join(model_path, "ff_config.json")
     if os.path.exists(config_path):
         with open(config_path) as f:
-            config = json.load(f)
-        max_length = config.get("max_length", 512)
+            max_length = json.load(f).get("max_length", 512)
 
+    return model, tokenizer, max_length
+
+
+def predict_tokens(model, tokenizer, source, target, max_length=512):
+    """Run inference on one sentence pair and return per-token predictions.
+
+    Pure function — no printing, no model loading. Returns a dict:
+        {
+          "source_tokens":  [w, ...],   "target_tokens":  [w, ...],
+          "source_labels":  ["O"|"B-FF", ...] aligned to source_tokens,
+          "target_labels":  ["O"|"B-FF", ...] aligned to target_tokens,
+          "source_ff":      [false-friend words on the source side],
+          "target_ff":      [false-friend words on the target side],
+        }
+    """
     src_words = source.split()
     tgt_words = target.split()
 
@@ -553,22 +563,17 @@ def predict(model_path, source, target):
         return_tensors="pt",
         padding=True,
     )
-    encoding_for_ids = tokenizer(
-        src_words, tgt_words,
-        is_split_into_words=True,
-        truncation=True,
-        max_length=max_length,
-    )
-
+    device = next(model.parameters()).device
     input_tensors = {k: v.to(device) for k, v in encoding.items()}
     with torch.no_grad():
         outputs = model(**input_tensors)
     preds = torch.argmax(outputs.logits, dim=-1)[0].cpu().numpy()
 
     # word_ids restart at 0 for the target sequence — use sequence_ids() to
-    # split predictions into separate src/tgt word→label dicts.
-    word_ids     = encoding_for_ids.word_ids()
-    sequence_ids = encoding_for_ids.sequence_ids()
+    # split predictions into separate src/tgt word→label maps. First subword
+    # of each word wins.
+    word_ids     = encoding.word_ids()
+    sequence_ids = encoding.sequence_ids()
 
     src_word_preds, tgt_word_preds = {}, {}
     for token_idx, (word_id, seq_id) in enumerate(zip(word_ids, sequence_ids)):
@@ -576,9 +581,29 @@ def predict(model_path, source, target):
             continue
         side = src_word_preds if seq_id == 0 else tgt_word_preds
         if word_id not in side:
-            side[word_id] = ID2LABEL[preds[token_idx]]
+            side[word_id] = ID2LABEL[int(preds[token_idx])]
 
-    src_ff, tgt_ff = [], []
+    src_labels = [src_word_preds.get(i, "O") for i in range(len(src_words))]
+    tgt_labels = [tgt_word_preds.get(i, "O") for i in range(len(tgt_words))]
+
+    return {
+        "source_tokens": src_words,
+        "target_tokens": tgt_words,
+        "source_labels": src_labels,
+        "target_labels": tgt_labels,
+        "source_ff": [w for w, l in zip(src_words, src_labels) if l == "B-FF"],
+        "target_ff": [w for w, l in zip(tgt_words, tgt_labels) if l == "B-FF"],
+    }
+
+
+def predict(model_path, source, target):
+    """Load a model, predict false friends for one pair, and print the result.
+
+    Thin CLI wrapper around load_model() + predict_tokens(). Returns the same
+    dict as predict_tokens(), plus index→label maps for backward compatibility.
+    """
+    model, tokenizer, max_length = load_model(model_path)
+    result = predict_tokens(model, tokenizer, source, target, max_length)
 
     print(f"\n{'='*60}")
     print(f"Source:  {source}")
@@ -586,37 +611,25 @@ def predict(model_path, source, target):
     print(f"{'='*60}\n")
     print(f"  {'Token':<25} {'Side':<10} {'Prediction':<10}")
     print(f"  {'-'*45}")
-
-    for i, word in enumerate(src_words):
-        label = src_word_preds.get(i, "O")
+    for word, label in zip(result["source_tokens"], result["source_labels"]):
         marker = " <<<" if label == "B-FF" else ""
         print(f"  {word:<25} {'source':<10} {label:<10}{marker}")
-        if label == "B-FF":
-            src_ff.append(word)
-    for i, word in enumerate(tgt_words):
-        label = tgt_word_preds.get(i, "O")
+    for word, label in zip(result["target_tokens"], result["target_labels"]):
         marker = " <<<" if label == "B-FF" else ""
         print(f"  {word:<25} {'target':<10} {label:<10}{marker}")
-        if label == "B-FF":
-            tgt_ff.append(word)
 
     print()
-    if src_ff or tgt_ff:
-        if src_ff:
-            print(f"  Source false friends: {src_ff}")
-        if tgt_ff:
-            print(f"  Target false friends: {tgt_ff}")
+    if result["source_ff"] or result["target_ff"]:
+        if result["source_ff"]:
+            print(f"  Source false friends: {result['source_ff']}")
+        if result["target_ff"]:
+            print(f"  Target false friends: {result['target_ff']}")
     else:
         print("  No false friends detected.")
 
-    return {
-        "source_tokens": src_words,
-        "target_tokens": tgt_words,
-        "source_ff": src_ff,
-        "target_ff": tgt_ff,
-        "source_predictions": {i: src_word_preds.get(i, "O") for i in range(len(src_words))},
-        "target_predictions": {i: tgt_word_preds.get(i, "O") for i in range(len(tgt_words))},
-    }
+    result["source_predictions"] = dict(enumerate(result["source_labels"]))
+    result["target_predictions"] = dict(enumerate(result["target_labels"]))
+    return result
 
 
 # ──────────────────────────────────────────────────────────────────────────────
