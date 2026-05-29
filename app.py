@@ -17,10 +17,13 @@ import os
 import html
 import streamlit as st
 
-# ── Model paths — match run_token_classification.sh --output_dir ──────────────
+# ── Model paths ───────────────────────────────────────────────────────────────
+# Each value may be a HuggingFace Hub repo id (e.g. "false-friends/en_es") or a
+# local directory written by run_token_classification.sh. Override per-pair with
+# the FF_MODEL_EN_ES / FF_MODEL_EN_FR environment variables.
 MODEL_PATHS = {
-    "EN-ES": os.getenv("FF_MODEL_EN_ES", "outputs/token_classification/ff_xlmr_es"),
-    "EN-FR": os.getenv("FF_MODEL_EN_FR", "outputs/token_classification/ff_xlmr_fr"),
+    "EN-ES": os.getenv("FF_MODEL_EN_ES", "false-friends/en_es"),
+    "EN-FR": os.getenv("FF_MODEL_EN_FR", "false-friends/en_fr"),
 }
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -84,12 +87,12 @@ def get_model(model_path: str):
 def run_inference(language_pair: str, english: str, other: str):
     """Return (result_dict_or_None, demo_mode, error).
 
-    result_dict has keys source_tokens, target_tokens, source_labels,
-    target_labels, source_ff, target_ff (see token_classification.predict_tokens).
+    The model is loaded from a HuggingFace Hub repo id or a local directory —
+    whatever MODEL_PATHS[language_pair] resolves to. result_dict has keys
+    source_tokens, target_tokens, source_labels, target_labels, source_ff,
+    target_ff (see token_classification.predict_tokens).
     """
     model_path = MODEL_PATHS[language_pair]
-    if not os.path.isdir(model_path):
-        return None, True, None
     try:
         from token_classification import predict_tokens  # noqa: PLC0415
         model, tokenizer, max_length = get_model(model_path)
@@ -182,11 +185,12 @@ if analyze_btn:
     if demo_mode:
         st.markdown(
             '<div class="demo-banner">'
-            "⚠️ <strong>Model not loaded</strong> — no trained model was found at "
+            "⚠️ <strong>Model not loaded</strong> — could not load "
             f"<code>{MODEL_PATHS[language_pair]}</code>. "
-            "Train a model (see <code>run_token_classification.sh</code>) or set the "
-            "<code>FF_MODEL_EN_ES</code> / <code>FF_MODEL_EN_FR</code> env var to enable "
-            "real inference."
+            "If this is a HuggingFace Hub repo, check the id, your network connection, "
+            "and (for private repos) that you are logged in via <code>huggingface-cli "
+            "login</code>. You can also override the source with the "
+            "<code>FF_MODEL_EN_ES</code> / <code>FF_MODEL_EN_FR</code> env var."
             "</div>",
             unsafe_allow_html=True,
         )

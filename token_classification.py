@@ -487,7 +487,8 @@ def train_model(
 
     config = {
         "model_name": model_name,
-        "dataset_name": dataset_name,
+        "dataset_name": (f"{data_dir}/EN-{lang.upper()}" if (data_dir and lang)
+                         else dataset_name),
         "label_list": LABEL_LIST,
         "max_length": max_length,
     }
@@ -495,10 +496,14 @@ def train_model(
         json.dump(config, f, indent=2)
 
     # Final evaluation on test set
+    if data_dir and lang:
+        data_desc = f"local JSONL  {data_dir}/EN-{lang.upper()}_{{train,test}}.jsonl"
+    else:
+        data_desc = f"HF Hub  {dataset_name}"
     print("\n\n" + "#" * 60)
     print(f"# FINAL TEST SET EVALUATION")
     print(f"# Model: {model_name}")
-    print(f"# Dataset: {dataset_name}")
+    print(f"# Dataset: {data_desc}")
     print("#" * 60)
 
     preds_output = trainer.predict(val_dataset)
