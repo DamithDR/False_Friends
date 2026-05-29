@@ -1,42 +1,53 @@
 """
 Token Classification for False Friend Detection using HuggingFace Transformers.
 
-Loads data from HuggingFace Hub: false-friends/en_es_token
 Source and target sentences are concatenated into a single sequence:
   [CLS] source_tokens [SEP] target_tokens [SEP]
+
+Data can come from EITHER:
+  * a local JSONL dir produced by create_token_classification_dataset.py,
+    selected with --data_dir + --lang  (recommended for this project), OR
+  * a HuggingFace Hub dataset id via --dataset_name.
 
 Notebook usage:
 
     from token_classification import train_model, predict, evaluate_model
 
-    # Train
+    # Train on local data
     trainer, tokenizer = train_model(
         model_name="xlm-roberta-base",
-        output_dir="./ff_model",
-        dataset_name="false-friends/en_es_token",
-        epochs=10,
-        batch_size=16,
-        lr=5e-5,
+        data_dir="data/token_classification",
+        lang="es",
+        output_dir="./ff_xlmr_es",
+        epochs=10, batch_size=16, lr=5e-5,
     )
 
     # Predict
     results = predict(
-        model_path="./ff_model",
+        model_path="./ff_xlmr_es",
         source="This is a sensible solution",
         target="Esta es una solución sensible",
     )
 
     # Evaluate
     evaluate_model(
-        model_path="./ff_model",
-        dataset_name="false-friends/en_es_token",
+        model_path="./ff_xlmr_es",
+        data_dir="data/token_classification",
+        lang="es",
     )
 
 CLI usage:
 
-    python token_classification.py train --model_name xlm-roberta-base --output_dir ./ff_model
-    python token_classification.py predict --model_path ./ff_model --source "..." --target "..."
-    python token_classification.py evaluate --model_path ./ff_model
+    python token_classification.py train \\
+        --model_name xlm-roberta-base \\
+        --data_dir data/token_classification --lang es \\
+        --output_dir ./ff_xlmr_es
+
+    python token_classification.py predict --model_path ./ff_xlmr_es \\
+        --source "..." --target "..."
+
+    python token_classification.py evaluate --model_path ./ff_xlmr_es \\
+        --data_dir data/token_classification --lang es
 """
 
 import argparse
@@ -88,9 +99,9 @@ class FalseFriendPairDataset(TorchDataset):
         return len(self.src_words)
 
     def __getitem__(self, idx):
-        s_words = self.src_words[idx]
+        s_words  = self.src_words[idx]
         s_labels = self.src_labels[idx]
-        t_words = self.tgt_words[idx]
+        t_words  = self.tgt_words[idx]
         t_labels = self.tgt_labels[idx]
 
         encoding = self.tokenizer(
@@ -102,31 +113,36 @@ class FalseFriendPairDataset(TorchDataset):
             padding=False,
         )
 
-        # Combined label list: source labels then target labels
-        combined_labels = list(s_labels) + list(t_labels)
+        # NOTE: when tokenising a sentence pair with is_split_into_words=True,
+        # word_ids() restarts at 0 for the target sequence. We therefore use
+        # sequence_ids() to know which side a token belongs to and look up the
+        # word index in the matching label list.
+        word_ids     = encoding.word_ids()
+        sequence_ids = encoding.sequence_ids()
 
-        # Align subword tokens to word-level labels
-        word_ids = encoding.word_ids()
         label_ids = []
-        previous_word_id = None
-        for word_id in word_ids:
-            if word_id is None:
+        prev_key  = (None, None)  # (seq_id, word_id) of the previously-emitted token
+        for word_id, seq_id in zip(word_ids, sequence_ids):
+            if word_id is None or seq_id is None:
                 label_ids.append(-100)
-            elif word_id != previous_word_id:
-                if word_id < len(combined_labels):
-                    label_ids.append(combined_labels[word_id] if isinstance(combined_labels[word_id], int) else LABEL2ID[combined_labels[word_id]])
-                else:
-                    label_ids.append(-100)
+                prev_key = (None, None)
+                continue
+
+            labels_for_seq = s_labels if seq_id == 0 else t_labels
+            key = (seq_id, word_id)
+            if key != prev_key and word_id < len(labels_for_seq):
+                lab = labels_for_seq[word_id]
+                label_ids.append(lab if isinstance(lab, int) else LABEL2ID[lab])
             else:
                 label_ids.append(-100)
-            previous_word_id = word_id
+            prev_key = key
 
         encoding["labels"] = label_ids
         return {k: torch.tensor(v) for k, v in encoding.items()}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Data loading from HuggingFace Hub
+# Data loading
 # ──────────────────────────────────────────────────────────────────────────────
 def load_hf_split(dataset_name, split, token=None):
     """Load a split from HuggingFace Hub and extract parallel lists.
@@ -137,6 +153,50 @@ def load_hf_split(dataset_name, split, token=None):
     tgt_words = [row["target_words"] for row in ds]
     tgt_labels = [row["target_labels"] for row in ds]
     return src_words, src_labels, tgt_words, tgt_labels
+
+
+def load_local_split(jsonl_path):
+    """Load a JSONL file produced by create_token_classification_dataset.py.
+    Each line must have keys: source_words, source_labels, target_words,
+    target_labels (labels as strings 'O'/'B-FF' or ints)."""
+    src_words, src_labels, tgt_words, tgt_labels = [], [], [], []
+    with open(jsonl_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            src_words.append(r["source_words"])
+            src_labels.append(r["source_labels"])
+            tgt_words.append(r["target_words"])
+            tgt_labels.append(r["target_labels"])
+    return src_words, src_labels, tgt_words, tgt_labels
+
+
+def resolve_splits(dataset_name=None, data_dir=None, lang=None, hf_token=None):
+    """Pick HF-Hub or local-JSONL loader and return (train, test) tuples.
+
+    Local mode is used when both ``data_dir`` and ``lang`` are given; files are
+    looked up at ``{data_dir}/EN-{LANG}_{train|test}.jsonl`` (lang upper-cased).
+    Otherwise falls back to the HuggingFace Hub via ``dataset_name``.
+    """
+    if data_dir and lang:
+        prefix = f"EN-{lang.upper()}"
+        train_path = os.path.join(data_dir, f"{prefix}_train.jsonl")
+        test_path  = os.path.join(data_dir, f"{prefix}_test.jsonl")
+        print(f"Loading local JSONL data:")
+        print(f"  train: {train_path}")
+        print(f"  test : {test_path}")
+        return load_local_split(train_path), load_local_split(test_path)
+
+    if not dataset_name:
+        raise ValueError(
+            "Provide either --data_dir and --lang for local JSONL, "
+            "or --dataset_name for a HuggingFace Hub dataset."
+        )
+    print(f"Loading dataset from HF Hub: {dataset_name}")
+    return (load_hf_split(dataset_name, "train", token=hf_token),
+            load_hf_split(dataset_name, "test",  token=hf_token))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -172,9 +232,11 @@ def detailed_report(predictions, label_ids, src_words_list, tgt_words_list):
     src_true, src_pred = [], []
     tgt_true, tgt_pred = [], []
 
+    truncated = 0
     for i, (pred_seq, label_seq) in enumerate(zip(preds, label_ids)):
         seq_preds, seq_labels = [], []
         n_src = len(src_words_list[i]) if i < len(src_words_list) else 0
+        n_tgt = len(tgt_words_list[i]) if i < len(tgt_words_list) else 0
 
         for p, l in zip(pred_seq, label_seq):
             if l == -100:
@@ -185,11 +247,17 @@ def detailed_report(predictions, label_ids, src_words_list, tgt_words_list):
         all_true.append(seq_labels)
         all_pred.append(seq_preds)
 
-        if n_src <= len(seq_labels):
+        # Per-side split is only safe when every word survived tokenisation.
+        # If max_length truncated some words, we can't reliably attribute the
+        # surviving labels to src vs tgt by index — skip this row for the
+        # per-side breakdown (it's still counted in overall metrics).
+        if len(seq_labels) == n_src + n_tgt:
             src_true.append(seq_labels[:n_src])
             src_pred.append(seq_preds[:n_src])
             tgt_true.append(seq_labels[n_src:])
             tgt_pred.append(seq_preds[n_src:])
+        else:
+            truncated += 1
 
     # Flatten for sklearn per-label metrics
     from sklearn.metrics import classification_report as sklearn_report
@@ -216,6 +284,11 @@ def detailed_report(predictions, label_ids, src_words_list, tgt_words_list):
     print(f"  Entity Recall:           {recall_score(all_true, all_pred):.4f}")
 
     # Per-side breakdown
+    if truncated:
+        print(f"\n  (Per-side metrics computed on {len(src_true)} / "
+              f"{len(src_true) + truncated} examples; "
+              f"{truncated} skipped due to max_length truncation.)")
+
     if src_true:
         print(f"\n--- Source (English) side ---")
         print(f"  Entity F1:        {f1_score(src_true, src_pred):.4f}")
@@ -223,7 +296,7 @@ def detailed_report(predictions, label_ids, src_words_list, tgt_words_list):
         print(f"  Entity Recall:    {recall_score(src_true, src_pred):.4f}")
 
     if tgt_true:
-        print(f"\n--- Target (Spanish) side ---")
+        print(f"\n--- Target side ---")
         print(f"  Entity F1:        {f1_score(tgt_true, tgt_pred):.4f}")
         print(f"  Entity Precision: {precision_score(tgt_true, tgt_pred):.4f}")
         print(f"  Entity Recall:    {recall_score(tgt_true, tgt_pred):.4f}")
@@ -310,6 +383,8 @@ def _compute_class_weights(label_lists, ff_weight=None):
 def train_model(
     model_name="xlm-roberta-base",
     dataset_name=DEFAULT_DATASET,
+    data_dir=None,
+    lang=None,
     output_dir="./ff_model",
     epochs=10,
     batch_size=16,
@@ -345,9 +420,9 @@ def train_model(
     Returns:
         (trainer, tokenizer) tuple
     """
-    print(f"Loading dataset: {dataset_name}")
-    tr_sw, tr_sl, tr_tw, tr_tl = load_hf_split(dataset_name, "train", token=hf_token)
-    va_sw, va_sl, va_tw, va_tl = load_hf_split(dataset_name, "test", token=hf_token)
+    (tr_sw, tr_sl, tr_tw, tr_tl), (va_sw, va_sl, va_tw, va_tl) = resolve_splits(
+        dataset_name=dataset_name, data_dir=data_dir, lang=lang, hf_token=hf_token,
+    )
     print(f"  Train: {len(tr_sw)} pairs, Test: {len(va_sw)} pairs")
 
     print(f"Loading tokenizer and model: {model_name}")
@@ -490,14 +565,18 @@ def predict(model_path, source, target):
         outputs = model(**input_tensors)
     preds = torch.argmax(outputs.logits, dim=-1)[0].cpu().numpy()
 
-    word_ids = encoding_for_ids.word_ids()
-    combined_words = src_words + tgt_words
-    n_src = len(src_words)
+    # word_ids restart at 0 for the target sequence — use sequence_ids() to
+    # split predictions into separate src/tgt word→label dicts.
+    word_ids     = encoding_for_ids.word_ids()
+    sequence_ids = encoding_for_ids.sequence_ids()
 
-    word_preds = {}
-    for token_idx, word_id in enumerate(word_ids):
-        if word_id is not None and word_id not in word_preds:
-            word_preds[word_id] = ID2LABEL[preds[token_idx]]
+    src_word_preds, tgt_word_preds = {}, {}
+    for token_idx, (word_id, seq_id) in enumerate(zip(word_ids, sequence_ids)):
+        if word_id is None or seq_id is None:
+            continue
+        side = src_word_preds if seq_id == 0 else tgt_word_preds
+        if word_id not in side:
+            side[word_id] = ID2LABEL[preds[token_idx]]
 
     src_ff, tgt_ff = [], []
 
@@ -508,13 +587,18 @@ def predict(model_path, source, target):
     print(f"  {'Token':<25} {'Side':<10} {'Prediction':<10}")
     print(f"  {'-'*45}")
 
-    for i, word in enumerate(combined_words):
-        label = word_preds.get(i, "O")
-        side = "source" if i < n_src else "target"
+    for i, word in enumerate(src_words):
+        label = src_word_preds.get(i, "O")
         marker = " <<<" if label == "B-FF" else ""
-        print(f"  {word:<25} {side:<10} {label:<10}{marker}")
+        print(f"  {word:<25} {'source':<10} {label:<10}{marker}")
         if label == "B-FF":
-            (src_ff if i < n_src else tgt_ff).append(word)
+            src_ff.append(word)
+    for i, word in enumerate(tgt_words):
+        label = tgt_word_preds.get(i, "O")
+        marker = " <<<" if label == "B-FF" else ""
+        print(f"  {word:<25} {'target':<10} {label:<10}{marker}")
+        if label == "B-FF":
+            tgt_ff.append(word)
 
     print()
     if src_ff or tgt_ff:
@@ -530,21 +614,26 @@ def predict(model_path, source, target):
         "target_tokens": tgt_words,
         "source_ff": src_ff,
         "target_ff": tgt_ff,
-        "predictions": {i: word_preds.get(i, "O") for i in range(len(combined_words))},
+        "source_predictions": {i: src_word_preds.get(i, "O") for i in range(len(src_words))},
+        "target_predictions": {i: tgt_word_preds.get(i, "O") for i in range(len(tgt_words))},
     }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Evaluate
 # ──────────────────────────────────────────────────────────────────────────────
-def evaluate_model(model_path, dataset_name=DEFAULT_DATASET, split="test", hf_token=None):
+def evaluate_model(model_path, dataset_name=DEFAULT_DATASET, split="test",
+                   data_dir=None, lang=None, hf_token=None):
     """
     Evaluate a trained model on a dataset split.
 
     Args:
         model_path:    Path to trained model directory
-        dataset_name:  HuggingFace dataset name (default: false-friends/en_es_token)
+        dataset_name:  HuggingFace dataset name (used if data_dir/lang not given)
         split:         Dataset split to evaluate on (default: test)
+        data_dir:      Local directory containing JSONL files
+                       (e.g. data/token_classification). Pair with --lang.
+        lang:          'es' or 'fr' — picks EN-ES or EN-FR files in data_dir.
         hf_token:      HuggingFace token for private datasets
     """
     print(f"Loading model from {model_path}")
@@ -559,8 +648,13 @@ def evaluate_model(model_path, dataset_name=DEFAULT_DATASET, split="test", hf_to
             config = json.load(f)
         max_length = config.get("max_length", 512)
 
-    print(f"Loading dataset: {dataset_name} [{split}]")
-    src_w, src_l, tgt_w, tgt_l = load_hf_split(dataset_name, split, token=hf_token)
+    if data_dir and lang:
+        path = os.path.join(data_dir, f"EN-{lang.upper()}_{split}.jsonl")
+        print(f"Loading local JSONL: {path}")
+        src_w, src_l, tgt_w, tgt_l = load_local_split(path)
+    else:
+        print(f"Loading dataset: {dataset_name} [{split}]")
+        src_w, src_l, tgt_w, tgt_l = load_hf_split(dataset_name, split, token=hf_token)
     print(f"  Evaluating on {len(src_w)} sentence pairs")
 
     dataset = FalseFriendPairDataset(src_w, src_l, tgt_w, tgt_l, tokenizer, max_length)
@@ -587,7 +681,13 @@ def main():
     # --- Train ---
     tp = subparsers.add_parser("train", help="Train a token classification model")
     tp.add_argument("--model_name", type=str, default="xlm-roberta-base")
-    tp.add_argument("--dataset_name", type=str, default=DEFAULT_DATASET)
+    tp.add_argument("--dataset_name", type=str, default=DEFAULT_DATASET,
+                    help="HuggingFace Hub dataset id (used if --data_dir/--lang not given).")
+    tp.add_argument("--data_dir", type=str, default=None,
+                    help="Local directory with EN-{ES|FR}_{train,test}.jsonl files "
+                         "(produced by create_token_classification_dataset.py).")
+    tp.add_argument("--lang", choices=["es", "fr"], default=None,
+                    help="Language pair to load from --data_dir.")
     tp.add_argument("--output_dir", type=str, default="./ff_model")
     tp.add_argument("--epochs", type=int, default=10)
     tp.add_argument("--batch_size", type=int, default=16)
@@ -612,6 +712,9 @@ def main():
     ep = subparsers.add_parser("evaluate", help="Evaluate model on a dataset")
     ep.add_argument("--model_path", type=str, required=True)
     ep.add_argument("--dataset_name", type=str, default=DEFAULT_DATASET)
+    ep.add_argument("--data_dir", type=str, default=None,
+                    help="Local directory with JSONL files (overrides --dataset_name).")
+    ep.add_argument("--lang", choices=["es", "fr"], default=None)
     ep.add_argument("--split", type=str, default="test")
     ep.add_argument("--hf_token", type=str, default=None)
 
@@ -621,6 +724,8 @@ def main():
         train_model(
             model_name=args.model_name,
             dataset_name=args.dataset_name,
+            data_dir=args.data_dir,
+            lang=args.lang,
             output_dir=args.output_dir,
             epochs=args.epochs,
             batch_size=args.batch_size,
@@ -636,7 +741,14 @@ def main():
     elif args.command == "predict":
         predict(args.model_path, args.source, args.target)
     elif args.command == "evaluate":
-        evaluate_model(args.model_path, args.dataset_name, args.split, args.hf_token)
+        evaluate_model(
+            args.model_path,
+            dataset_name=args.dataset_name,
+            split=args.split,
+            data_dir=args.data_dir,
+            lang=args.lang,
+            hf_token=args.hf_token,
+        )
 
 
 if __name__ == "__main__":
