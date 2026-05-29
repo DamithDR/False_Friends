@@ -1,6 +1,13 @@
-datasets
-scipy
-numpy
+torch
 transformers
+accelerate>=1.1.0
+datasets
+seqeval
+scikit-learn
+sentencepiece
+protobuf
+openpyxl
+numpy
+scipy
 OpenAI
 streamlit

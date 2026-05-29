@@ -473,7 +473,7 @@ def train_model(
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         compute_metrics=compute_metrics,
         callbacks=callbacks,
     )
@@ -663,7 +663,7 @@ def evaluate_model(model_path, dataset_name=DEFAULT_DATASET, split="test",
     trainer = Trainer(
         model=model,
         data_collator=data_collator,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         compute_metrics=compute_metrics,
     )
 
