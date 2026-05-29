@@ -2,24 +2,28 @@
 False Friends Detector — Streamlit UI
 ======================================
 Select a language pair (EN-ES or EN-FR), enter an English sentence and its
-translation, then click "Analyze" to see whether the pair contains false
-friends and, if so, which words they are.
+translation, then click "Analyze" to see — at the token level — which words are
+false friends, highlighted in place on both sides.
 
 Backend integration
 -------------------
-Set the MODEL_PATHS dict below to wherever your trained models live.
-When a model directory is present the app calls token_classification.predict();
-otherwise it enters demo-mode so the UI can still be developed and tested.
+MODEL_PATHS points at the directories written by run_token_classification.sh
+(token_classification.py train --output_dir ...). Override per-pair with the
+FF_MODEL_EN_ES / FF_MODEL_EN_FR environment variables. When a model directory
+is missing the app falls back to demo mode so the UI still renders.
 """
 
 import os
-import re
+import html
 import streamlit as st
 
-# ── Model paths — update once models are trained ──────────────────────────────
+# ── Model paths ───────────────────────────────────────────────────────────────
+# Each value may be a HuggingFace Hub repo id (e.g. "false-friends/en_es") or a
+# local directory written by run_token_classification.sh. Override per-pair with
+# the FF_MODEL_EN_ES / FF_MODEL_EN_FR environment variables.
 MODEL_PATHS = {
-    "EN-ES": os.getenv("FF_MODEL_EN_ES", "./ff_model_en_es"),
-    "EN-FR": os.getenv("FF_MODEL_EN_FR", "./ff_model_en_fr"),
+    "EN-ES": os.getenv("FF_MODEL_EN_ES", "false-friends/en_es"),
+    "EN-FR": os.getenv("FF_MODEL_EN_FR", "false-friends/en_fr"),
 }
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -33,6 +37,11 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+    .ff-sentence {
+        font-size: 1.1rem;
+        line-height: 2.2rem;
+        word-spacing: 0.1rem;
+    }
     .ff-highlight {
         background-color: #ff4b4b;
         color: white;
@@ -40,10 +49,8 @@ st.markdown(
         border-radius: 4px;
         font-weight: 600;
     }
-    .ff-sentence {
-        font-size: 1.1rem;
-        line-height: 2rem;
-        word-spacing: 0.15rem;
+    .ff-token-ok {
+        padding: 2px 3px;
     }
     .result-box {
         border-radius: 8px;
@@ -51,14 +58,8 @@ st.markdown(
         margin-top: 8px;
         font-size: 0.95rem;
     }
-    .result-positive {
-        background-color: #fff0f0;
-        border-left: 4px solid #ff4b4b;
-    }
-    .result-negative {
-        background-color: #f0fff4;
-        border-left: 4px solid #21c55d;
-    }
+    .result-positive { background-color: #fff0f0; border-left: 4px solid #ff4b4b; }
+    .result-negative { background-color: #f0fff4; border-left: 4px solid #21c55d; }
     .demo-banner {
         background-color: #fffbeb;
         border: 1px solid #f59e0b;
@@ -74,78 +75,67 @@ st.markdown(
 )
 
 
-# ── Helper: highlight false-friend tokens in a sentence ──────────────────────
-def highlight_tokens(sentence: str, false_friends: list[str]) -> str:
-    """Return HTML with false-friend words wrapped in a highlight span."""
-    if not false_friends:
-        return f'<span class="ff-sentence">{sentence}</span>'
-
-    # Build a regex that matches any of the false-friend words (case-insensitive,
-    # whole-word boundary) and wraps them in a highlight span.
-    escaped = [re.escape(w) for w in false_friends]
-    pattern = r"\b(" + "|".join(escaped) + r")\b"
-
-    def replacer(m):
-        return f'<span class="ff-highlight">{m.group(0)}</span>'
-
-    highlighted = re.sub(pattern, replacer, sentence, flags=re.IGNORECASE)
-    return f'<span class="ff-sentence">{highlighted}</span>'
+# ── Cached model loader ───────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def get_model(model_path: str):
+    """Load (model, tokenizer, max_length) once per path. Cached across reruns."""
+    from token_classification import load_model  # noqa: PLC0415
+    return load_model(model_path)
 
 
-# ── Backend: attempt real inference, fall back to demo mode ──────────────────
+# ── Backend: token-level inference, fall back to demo mode ────────────────────
 def run_inference(language_pair: str, english: str, other: str):
-    """
-    Returns (source_ff, target_ff, demo_mode).
+    """Return (result_dict_or_None, demo_mode, error).
 
-    When the trained model is present the real predict() function is called.
-    Otherwise demo_mode=True is returned with empty lists so the UI can show
-    a 'model not loaded' notice instead of crashing.
+    The model is loaded from a HuggingFace Hub repo id or a local directory —
+    whatever MODEL_PATHS[language_pair] resolves to. result_dict has keys
+    source_tokens, target_tokens, source_labels, target_labels, source_ff,
+    target_ff (see token_classification.predict_tokens).
     """
     model_path = MODEL_PATHS[language_pair]
-
-    if not os.path.isdir(model_path):
-        # Model not trained / path not found — demo mode
-        return [], [], True
-
-    # ── Real inference ────────────────────────────────────────────────────────
-    # TODO: swap the import below for your sentence-level classifier once it is
-    #       ready.  The token_classification.predict() already returns both the
-    #       token-level false-friend words AND implicitly tells you whether the
-    #       sentence pair contains false friends (non-empty lists → has FF).
     try:
-        from token_classification import predict  # noqa: PLC0415
-
-        result = predict(model_path=model_path, source=english, target=other)
-        return result["source_ff"], result["target_ff"], False
+        from token_classification import predict_tokens  # noqa: PLC0415
+        model, tokenizer, max_length = get_model(model_path)
+        result = predict_tokens(model, tokenizer, english, other, max_length)
+        return result, False, None
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Inference error: {exc}")
-        return [], [], True
+        return None, True, str(exc)
+
+
+# ── Render a tokenised sentence with per-token highlighting ───────────────────
+def render_tokens(tokens: list[str], labels: list[str]) -> str:
+    """Highlight tokens whose predicted label is B-FF, by position."""
+    spans = []
+    for tok, lab in zip(tokens, labels):
+        safe = html.escape(tok)
+        if lab == "B-FF":
+            spans.append(f'<span class="ff-highlight">{safe}</span>')
+        else:
+            spans.append(f'<span class="ff-token-ok">{safe}</span>')
+    return '<span class="ff-sentence">' + " ".join(spans) + "</span>"
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 st.title("False Friends Detector")
 st.caption(
     "A false friend is a word that looks similar in two languages but means "
-    "something different. Enter a sentence pair to check for false friends."
+    "something different. Enter a sentence pair to detect false friends at the "
+    "token level."
 )
 
 st.divider()
 
-# Language pair selector
 language_pair = st.radio(
     "Language pair",
     options=["EN-ES", "EN-FR"],
     format_func=lambda x: "English ↔ Spanish" if x == "EN-ES" else "English ↔ French",
     horizontal=True,
 )
-
 other_lang_label = "Spanish" if language_pair == "EN-ES" else "French"
 
-st.write("")  # spacing
+st.write("")
 
-# Text input columns
 col_en, col_other = st.columns(2)
-
 with col_en:
     st.markdown("**English sentence**")
     english_text = st.text_area(
@@ -155,7 +145,6 @@ with col_en:
         label_visibility="collapsed",
         key="english_input",
     )
-
 with col_other:
     st.markdown(f"**{other_lang_label} sentence**")
     other_text = st.text_area(
@@ -171,8 +160,7 @@ with col_other:
     )
 
 st.write("")
-
-analyze_btn = st.button("Analyze", type="primary", use_container_width=False)
+analyze_btn = st.button("Analyze", type="primary")
 
 # ── Results ───────────────────────────────────────────────────────────────────
 if analyze_btn:
@@ -181,106 +169,91 @@ if analyze_btn:
 
     if not english_text or not other_text:
         st.warning("Please fill in both text boxes before analyzing.")
+        st.stop()
+
+    with st.spinner("Analyzing sentence pair…"):
+        result, demo_mode, error = run_inference(
+            language_pair, english_text, other_text
+        )
+
+    st.divider()
+    st.subheader("Results")
+
+    if error:
+        st.error(f"Inference error: {error}")
+
+    if demo_mode:
+        st.markdown(
+            '<div class="demo-banner">'
+            "⚠️ <strong>Model not loaded</strong> — could not load "
+            f"<code>{MODEL_PATHS[language_pair]}</code>. "
+            "If this is a HuggingFace Hub repo, check the id, your network connection, "
+            "and (for private repos) that you are logged in via <code>huggingface-cli "
+            "login</code>. You can also override the source with the "
+            "<code>FF_MODEL_EN_ES</code> / <code>FF_MODEL_EN_FR</code> env var."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        st.stop()
+
+    source_ff = result["source_ff"]
+    target_ff = result["target_ff"]
+    has_ff = bool(source_ff or target_ff)
+
+    # ── Sentence-level verdict (derived from token predictions) ───────────────
+    if has_ff:
+        st.markdown(
+            '<div class="result-box result-positive">'
+            "🔴 <strong>Verdict:</strong> This sentence pair "
+            "<strong>contains false friends</strong>."
+            "</div>",
+            unsafe_allow_html=True,
+        )
     else:
-        with st.spinner("Analyzing sentence pair…"):
-            source_ff, target_ff, demo_mode = run_inference(
-                language_pair, english_text, other_text
-            )
+        st.markdown(
+            '<div class="result-box result-negative">'
+            "🟢 <strong>Verdict:</strong> No false friends detected in this sentence pair."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    st.write("")
 
-        st.divider()
-        st.subheader("Results")
+    # ── Token-level highlighted sentences ─────────────────────────────────────
+    st.markdown("**Token-level detection**")
+    hl_en, hl_other = st.columns(2)
+    with hl_en:
+        st.caption(f"English — {', '.join(source_ff) if source_ff else 'no false friends'}")
+        st.markdown(
+            render_tokens(result["source_tokens"], result["source_labels"]),
+            unsafe_allow_html=True,
+        )
+    with hl_other:
+        st.caption(f"{other_lang_label} — {', '.join(target_ff) if target_ff else 'no false friends'}")
+        st.markdown(
+            render_tokens(result["target_tokens"], result["target_labels"]),
+            unsafe_allow_html=True,
+        )
 
-        # Demo-mode banner
-        if demo_mode:
-            st.markdown(
-                '<div class="demo-banner">'
-                "⚠️ <strong>Model not loaded</strong> — no trained model was found at "
-                f"<code>{MODEL_PATHS[language_pair]}</code>. "
-                "The results below are placeholders. Train or point to your model to "
-                "enable real inference."
-                "</div>",
-                unsafe_allow_html=True,
-            )
+    st.write("")
 
-        has_ff = bool(source_ff or target_ff)
+    # ── Per-token table (only flagged tokens, with position) ──────────────────
+    rows = []
+    for i, (tok, lab) in enumerate(zip(result["source_tokens"], result["source_labels"])):
+        if lab == "B-FF":
+            rows.append({"Side": "English", "Position": i, "Token": tok, "Label": lab})
+    for i, (tok, lab) in enumerate(zip(result["target_tokens"], result["target_labels"])):
+        if lab == "B-FF":
+            rows.append({"Side": other_lang_label, "Position": i, "Token": tok, "Label": lab})
 
-        # ── Sentence-level verdict ────────────────────────────────────────────
-        if demo_mode:
-            verdict_html = (
-                '<div class="result-box result-positive">'
-                "🔴 <strong>Verdict:</strong> (demo) False friends may be present — "
-                "load a trained model for a real result."
-                "</div>"
-            )
-        elif has_ff:
-            verdict_html = (
-                '<div class="result-box result-positive">'
-                "🔴 <strong>Verdict:</strong> This sentence pair <strong>contains false friends</strong>."
-                "</div>"
-            )
-        else:
-            verdict_html = (
-                '<div class="result-box result-negative">'
-                "🟢 <strong>Verdict:</strong> No false friends detected in this sentence pair."
-                "</div>"
-            )
+    if rows:
+        st.markdown("**Detected false-friend tokens**")
+        st.table(rows)
 
-        st.markdown(verdict_html, unsafe_allow_html=True)
-        st.write("")
-
-        # ── Token-level highlights ────────────────────────────────────────────
-        if has_ff or demo_mode:
-            # In demo mode show placeholder words so the highlight styling is visible
-            demo_source_ff = ["sensible"] if demo_mode else []
-            demo_target_ff = (
-                ["sensible"] if (demo_mode and language_pair == "EN-ES") else
-                ["sensible"] if demo_mode else []
-            )
-            display_source_ff = source_ff if not demo_mode else demo_source_ff
-            display_target_ff = target_ff if not demo_mode else demo_target_ff
-
-            # Use demo placeholder sentences when in demo mode so the highlight
-            # renders on something even if the user left the boxes empty.
-            display_english = english_text or "This is a sensible solution."
-            display_other = other_text or (
-                "Esta es una solución sensible."
-                if language_pair == "EN-ES"
-                else "C'est une solution sensible."
-            )
-
-            st.markdown("**Highlighted false friends**")
-
-            hl_col_en, hl_col_other = st.columns(2)
-
-            with hl_col_en:
-                st.markdown(
-                    f"*English ({', '.join(display_source_ff) or 'none'})*",
-                    unsafe_allow_html=True,
-                )
-                st.markdown(
-                    highlight_tokens(display_english, display_source_ff),
-                    unsafe_allow_html=True,
-                )
-
-            with hl_col_other:
-                st.markdown(
-                    f"*{other_lang_label} ({', '.join(display_target_ff) or 'none'})*",
-                    unsafe_allow_html=True,
-                )
-                st.markdown(
-                    highlight_tokens(display_other, display_target_ff),
-                    unsafe_allow_html=True,
-                )
-
-            st.write("")
-
-            # Word-level summary table
-            all_ff_words = []
-            for w in display_source_ff:
-                all_ff_words.append({"Side": "English", "False friend word": w})
-            for w in display_target_ff:
-                all_ff_words.append({"Side": other_lang_label, "False friend word": w})
-
-            if all_ff_words:
-                st.markdown("**Detected false friend words**")
-                st.table(all_ff_words)
+    # ── Full token-by-token breakdown (collapsible) ───────────────────────────
+    with st.expander("Show full token-by-token predictions"):
+        full_rows = []
+        for i, (tok, lab) in enumerate(zip(result["source_tokens"], result["source_labels"])):
+            full_rows.append({"Side": "English", "Position": i, "Token": tok, "Label": lab})
+        for i, (tok, lab) in enumerate(zip(result["target_tokens"], result["target_labels"])):
+            full_rows.append({"Side": other_lang_label, "Position": i, "Token": tok, "Label": lab})
+        st.dataframe(full_rows, use_container_width=True, hide_index=True)
