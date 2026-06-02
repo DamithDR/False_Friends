@@ -1,9 +1,9 @@
 """
 False Friends Detector — Streamlit UI
 ======================================
-Select a language pair (EN-ES or EN-FR), enter an English sentence and its
-translation, then click "Analyze" to see — at the token level — which words are
-false friends, highlighted in place on both sides.
+Enter an English sentence and its Spanish translation, then click "Analyze" to
+see — at the token level — which words are false friends, highlighted in place
+on both sides. (English ↔ Spanish only for now; French is disabled.)
 
 Backend integration
 -------------------
@@ -23,7 +23,7 @@ import streamlit as st
 # the FF_MODEL_EN_ES / FF_MODEL_EN_FR environment variables.
 MODEL_PATHS = {
     "EN-ES": os.getenv("FF_MODEL_EN_ES", "false-friends/en_es"),
-    "EN-FR": os.getenv("FF_MODEL_EN_FR", "false-friends/en_fr"),
+    # "EN-FR": os.getenv("FF_MODEL_EN_FR", "false-friends/en_fr"),  # hidden for now
 }
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -125,15 +125,10 @@ st.caption(
 
 st.divider()
 
-language_pair = st.radio(
-    "Language pair",
-    options=["EN-ES", "EN-FR"],
-    format_func=lambda x: "English ↔ Spanish" if x == "EN-ES" else "English ↔ French",
-    horizontal=True,
-)
-other_lang_label = "Spanish" if language_pair == "EN-ES" else "French"
-
-st.write("")
+# Only English ↔ Spanish is enabled for now. To re-enable French, restore the
+# "EN-FR" entry in MODEL_PATHS and swap this back to a st.radio selector.
+language_pair = "EN-ES"
+other_lang_label = "Spanish"
 
 col_en, col_other = st.columns(2)
 with col_en:
@@ -149,11 +144,7 @@ with col_other:
     st.markdown(f"**{other_lang_label} sentence**")
     other_text = st.text_area(
         label=f"{other_lang_label} sentence",
-        placeholder=(
-            "e.g. Esta es una solución sensible."
-            if language_pair == "EN-ES"
-            else "e.g. C'est une solution sensible."
-        ),
+        placeholder="e.g. Esta es una solución sensible.",
         height=140,
         label_visibility="collapsed",
         key="other_input",
